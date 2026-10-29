@@ -1,0 +1,339 @@
+
+============================================================
+get_station_departures
+============================================================
+def get_station_departures(
+    daily,
+    origin,
+    departure_time,
+    window_minutes=30
+):
+    """
+    Find scheduled departures from an origin station
+    within the requested time window.
+
+    Excludes trips that terminate at the origin.
+    """
+
+    # 1. Find the station ID
+    origin_ids = set(
+        station_lookup.loc[
+            station_lookup["stop_name"] == origin,
+            "station_id"
+        ]
+    )
+
+    if not origin_ids:
+        raise ValueError(f"Station not found: {origin}")
+
+    # 2. Convert departure time to seconds
+    time_string = (
+        departure_time
+        if len(departure_time) == 8
+        else departure_time + ":00"
+    )
+
+    requested_seconds = time_to_seconds(time_string)
+
+    # 3. Find departures within the time window
+    departures = daily[
+        daily["station_id"].isin(origin_ids)
+        &
+        daily["departure_seconds"].between(
+            requested_seconds,
+            requested_seconds + window_minutes * 60
+        )
+    ].copy()
+
+    # 4. Identify the final stop of each trip
+    last_sequences = daily.groupby(
+        "trip_id"
+    )["stop_sequence"].max()
+
+    departures["last_stop_sequence"] = (
+        departures["trip_id"].map(last_sequences)
+    )
+
+    # 5. Exclude terminating services
+    departures = departures[
+        departures["stop_sequence"]
+        < departures["last_stop_sequence"]
+    ].copy()
+
+    # 6. Sort departures
+    return departures.sort_values(
+        "departure_seconds"
+    ).reset_index(drop=True)
+
+
+============================================================
+find_direct_journeys
+============================================================
+def find_direct_journeys(
+    daily,
+    origin,
+    destination,
+    departure_time,
+    window_minutes=30
+):
+    """
+    Find direct scheduled journeys between two stations.
+    """
+
+    # 1. Get valid origin departures
+    departures = get_station_departures(
+        daily=daily,
+        origin=origin,
+        departure_time=departure_time,
+        window_minutes=window_minutes
+    )
+
+    # 2. Find destination station IDs
+    destination_ids = set(
+        station_lookup.loc[
+            station_lookup["stop_name"] == destination,
+            "station_id"
+        ]
+    )
+
+    if not destination_ids:
+        raise ValueError(f"Destination not found: {destination}")
+
+    # 3. Find destination arrivals
+    arrivals = daily[
+        daily["station_id"].isin(destination_ids)
+    ][
+        [
+            "trip_id",
+            "stop_sequence",
+            "arrival_seconds",
+            "arrival_time"
+        ]
+    ].rename(columns={
+        "stop_sequence": "destination_sequence",
+        "arrival_seconds": "destination_arrival_seconds",
+        "arrival_time": "destination_arrival_time"
+    })
+
+    # 4. Match origin departures to destination arrivals
+    journeys = departures.merge(
+        arrivals,
+        on="trip_id",
+        how="inner"
+    )
+
+    # 5. Destination must be after origin
+    journeys = journeys[
+        journeys["destination_sequence"]
+        > journeys["stop_sequence"]
+    ].copy()
+
+    # 6. Calculate journey duration
+    journeys["journey_duration_min"] = (
+        (
+            journeys["destination_arrival_seconds"]
+            - journeys["departure_seconds"]
+        ) / 60
+    ).round(2)
+
+    # 7. Add useful output fields
+    journeys["journey_type"] = "Direct"
+    journeys["transfers"] = 0
+
+    # 8. Remove duplicate boarding/arrival combinations
+    journeys = journeys.drop_duplicates(
+        subset=[
+            "trip_id",
+            "stop_id",
+            "stop_sequence",
+            "destination_sequence"
+        ]
+    )
+
+    # 9. Rank by earliest arrival
+    journeys = journeys.sort_values(
+        [
+            "destination_arrival_seconds",
+            "departure_seconds"
+        ]
+    ).reset_index(drop=True)
+
+    return journeys
+
+
+============================================================
+find_one_transfer_journeys
+============================================================
+def find_one_transfer_journeys(
+    daily,
+    origin,
+    destination,
+    departure_time,
+    window_minutes=30,
+    connection_window_minutes=30
+):
+    """Find scheduled journeys requiring one platform transfer."""
+
+    departures = get_station_departures(
+        daily, origin, departure_time, window_minutes
+    ).copy()
+
+    origin_ids = set(
+        station_lookup.loc[
+            station_lookup["stop_name"] == origin, "station_id"
+        ]
+    )
+    destination_ids = set(
+        station_lookup.loc[
+            station_lookup["stop_name"] == destination, "station_id"
+        ]
+    )
+
+    if not destination_ids:
+        raise ValueError(f"Destination not found: {destination}")
+
+    # Identify each first-leg boarding event
+    departures["boarding_id"] = range(len(departures))
+
+    first_boardings = departures[
+        [
+            "boarding_id", "trip_id", "stop_id",
+            "stop_sequence", "departure_seconds",
+            "departure_time", "route_short_name",
+            "transport_mode"
+        ]
+    ].rename(columns={
+        "stop_id": "origin_platform",
+        "stop_sequence": "origin_sequence",
+        "departure_seconds": "origin_departure_seconds",
+        "departure_time": "origin_departure_time",
+        "route_short_name": "first_line",
+        "transport_mode": "first_mode"
+    })
+
+    # Find downstream stops on first-leg services
+    first_stops = first_boardings.merge(
+        daily[
+            [
+                "trip_id", "stop_id", "station_id",
+                "stop_sequence", "arrival_seconds",
+                "arrival_time"
+            ]
+        ],
+        on="trip_id",
+        how="inner"
+    )
+
+    first_stops = first_stops[
+        (first_stops["stop_sequence"] > first_stops["origin_sequence"])
+        & (~first_stops["station_id"].isin(origin_ids))
+        & (~first_stops["station_id"].isin(destination_ids))
+    ].copy()
+
+    # Match first-leg arrival platforms to reachable platforms
+    connections = first_stops.merge(
+        all_platform_transfers[
+            ["from_stop_id", "to_stop_id", "minimum_transfer_seconds"]
+        ],
+        left_on="stop_id",
+        right_on="from_stop_id",
+        how="inner"
+    )
+
+    connections["earliest_boarding_seconds"] = (
+        connections["arrival_seconds"]
+        + connections["minimum_transfer_seconds"]
+    )
+
+    # Find scheduled departures from connecting platforms
+    second_departures = daily[
+        [
+            "trip_id", "stop_id", "stop_sequence",
+            "departure_seconds", "departure_time",
+            "route_short_name", "transport_mode"
+        ]
+    ].rename(columns={
+        "trip_id": "second_trip_id",
+        "stop_id": "second_platform",
+        "stop_sequence": "second_boarding_sequence",
+        "departure_seconds": "second_departure_seconds",
+        "departure_time": "second_departure_time",
+        "route_short_name": "second_line",
+        "transport_mode": "second_mode"
+    })
+
+    connections = connections.merge(
+        second_departures,
+        left_on="to_stop_id",
+        right_on="second_platform",
+        how="inner"
+    )
+
+    connections = connections[
+        (connections["second_trip_id"] != connections["trip_id"])
+        & (
+            connections["second_departure_seconds"]
+            >= connections["earliest_boarding_seconds"]
+        )
+        & (
+            connections["second_departure_seconds"]
+            <= connections["arrival_seconds"]
+               + connection_window_minutes * 60
+        )
+    ].copy()
+
+    # Find destination arrivals on second-leg services
+    destination_arrivals = daily[
+        daily["station_id"].isin(destination_ids)
+    ][
+        ["trip_id", "stop_sequence", "arrival_seconds", "arrival_time"]
+    ].rename(columns={
+        "trip_id": "second_trip_id",
+        "stop_sequence": "destination_sequence",
+        "arrival_seconds": "destination_arrival_seconds",
+        "arrival_time": "destination_arrival_time"
+    })
+
+    journeys = connections.merge(
+        destination_arrivals,
+        on="second_trip_id",
+        how="inner"
+    )
+
+    journeys = journeys[
+        journeys["destination_sequence"]
+        > journeys["second_boarding_sequence"]
+    ].copy()
+
+    journeys["journey_duration_min"] = (
+        (
+            journeys["destination_arrival_seconds"]
+            - journeys["origin_departure_seconds"]
+        ) / 60
+    ).round(2)
+
+    journeys["journey_type"] = "One transfer"
+    journeys["transfers"] = 1
+
+    journeys = journeys.merge(
+        station_lookup.rename(
+            columns={"stop_name": "transfer_station"}
+        ),
+        on="station_id",
+        how="left"
+    )
+
+    return journeys.sort_values(
+        ["destination_arrival_seconds", "origin_departure_seconds"]
+    ).reset_index(drop=True)
+
+
+============================================================
+find_third_leg_journeys
+============================================================
+find_third_leg_journeys: NOT DEFINED
+
+============================================================
+pareto_filter
+============================================================
+pareto_filter: NOT DEFINED
